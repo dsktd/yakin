@@ -1,0 +1,71 @@
+name: CI
+
+# CI builds the flake's own checks (flake.nix), so a green run means the same
+# as `just nix-check` locally: formatting, clippy with -D warnings, the tests,
+# and every package (daemon and cli, osd, tray, window, 3D view). Nothing here
+# needs a controller, uinput or a compositor.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to a pull request cancels its running checks; main runs finish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      # Each entry builds the flake checks it names; one job per dependency set
+      # (flake.nix: plain, window, 3D view), so each caches its own store.
+      matrix:
+        include:
+          - name: format
+            checks: fmt
+          - name: daemon
+            checks: clippy yakin yakin-osd yakin-tray
+          - name: window
+            checks: clippy-ui yakin-ui
+          - name: view
+            checks: clippy-view yakin-view
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+      # The store between runs, one per job and lock files; a pull request
+      # restores what main saved and saves nothing of its own.
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+        with:
+          primary-key: nix-${{ matrix.name }}-${{ hashFiles('flake.lock', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-${{ matrix.name }}-
+          gc-max-store-size-linux: 4G
+          save: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build
+        env:
+          CHECKS: ${{ matrix.checks }}
+        run: |
+          targets=()
+          for check in $CHECKS; do
+            targets+=(".#checks.x86_64-linux.$check")
+          done
+          nix build --no-link --print-build-logs "${targets[@]}"
+
+  # The one check to require: fails unless every job above passed.
+  ci-ok:
+    if: always()
+    needs: [check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job passed
+        env:
+          RESULT: ${{ needs.check.result }}
+        run: test "$RESULT" = success
